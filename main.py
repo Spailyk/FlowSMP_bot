@@ -2,9 +2,11 @@ import os
 import logging
 import sqlite3
 import asyncio
-import threading
 from datetime import datetime
-from flask import Flask, request, jsonify
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+import uvicorn
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, FSInputFile
@@ -13,6 +15,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+import threading
 
 # ==================== НАСТРОЙКИ ====================
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +26,6 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set in environment variables")
 
 ADMIN_ID = 7019179888  # Ваш ID
-
 REPORTS_MEDIA_DIR = "reports_media"
 os.makedirs(REPORTS_MEDIA_DIR, exist_ok=True)
 
@@ -31,9 +33,6 @@ os.makedirs(REPORTS_MEDIA_DIR, exist_ok=True)
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
-# Flask приложение
-app = Flask(__name__)
 
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
@@ -72,7 +71,7 @@ def init_db():
 
 init_db()
 
-# ==================== УПРОЩЁННЫЕ ФУНКЦИИ БД ====================
+# ==================== ФУНКЦИИ БД ====================
 def add_request(user_id, user_name, username, nickname, age, reason):
     conn = sqlite3.connect('bot.db')
     cur = conn.cursor()
@@ -156,7 +155,7 @@ def get_back_button():
         inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]]
     )
 
-def get_admin_request_keyboard(request_id, user_id, user_name):
+def get_admin_request_keyboard(request_id, user_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{request_id}_{user_id}"),
@@ -164,7 +163,7 @@ def get_admin_request_keyboard(request_id, user_id, user_name):
         ]
     )
 
-def get_admin_report_keyboard(report_id, user_id, user_name):
+def get_admin_report_keyboard(report_id, user_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_rep_{report_id}_{user_id}"),
@@ -184,7 +183,7 @@ class ReportForm(StatesGroup):
     evidence = State()
     time = State()
 
-# ==================== ОБРАБОТЧИКИ ====================
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_name = message.from_user.first_name
@@ -254,7 +253,7 @@ async def process_reason(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
         return
-    
+
     data = await state.get_data()
     request_id = add_request(
         message.from_user.id,
@@ -264,14 +263,12 @@ async def process_reason(message: Message, state: FSMContext):
         data['age'],
         message.text
     )
-    
+
     await message.answer(f"✅ Заявка №{request_id} принята!", reply_markup=get_main_keyboard())
-    
-    # Уведомление админу
     await bot.send_message(
         ADMIN_ID,
-        f"❗️Новая заявка #{request_id}\nОт: {message.from_user.full_name}\nНик: {data['nickname']}",
-        reply_markup=get_admin_request_keyboard(request_id, message.from_user.id, message.from_user.full_name)
+        f"❗️ Новая заявка #{request_id}\nОт: {message.from_user.full_name}\nНик: {data['nickname']}",
+        reply_markup=get_admin_request_keyboard(request_id, message.from_user.id)
     )
     await state.clear()
 
@@ -297,7 +294,7 @@ async def process_report_reason(message: Message, state: FSMContext):
         await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
         return
     await state.update_data(reason=message.text)
-    await message.answer("📎 Доказательства (текст):", reply_markup=get_cancel_keyboard())
+    await message.answer("📎 Доказательства (текст или фото):", reply_markup=get_cancel_keyboard())
     await state.set_state(ReportForm.evidence)
 
 @dp.message(ReportForm.evidence)
@@ -306,7 +303,26 @@ async def process_evidence(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
         return
-    await state.update_data(evidence=message.text, evidence_type='text')
+
+    evidence_text = None
+    evidence_type = 'text'
+
+    if message.photo:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        filename = f"report_photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{message.from_user.id}.jpg"
+        file_path = os.path.join(REPORTS_MEDIA_DIR, filename)
+        await bot.download_file(file.file_path, file_path)
+        evidence_type = 'photo'
+        evidence_text = file_path
+    elif message.text:
+        evidence_text = message.text
+        evidence_type = 'text'
+    else:
+        await message.answer("❌ Пожалуйста, отправьте текст или фото.")
+        return
+
+    await state.update_data(evidence=evidence_text, evidence_type=evidence_type)
     await message.answer("⏳ Время нарушения:", reply_markup=get_cancel_keyboard())
     await state.set_state(ReportForm.time)
 
@@ -316,7 +332,7 @@ async def process_time(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ Отменено", reply_markup=get_main_keyboard())
         return
-    
+
     data = await state.get_data()
     report_id = add_report(
         message.from_user.id,
@@ -328,14 +344,12 @@ async def process_time(message: Message, state: FSMContext):
         data['evidence_type'],
         message.text
     )
-    
+
     await message.answer(f"✅ Репорт №{report_id} отправлен!", reply_markup=get_main_keyboard())
-    
-    # Уведомление админу
     await bot.send_message(
         ADMIN_ID,
-        f"⚠️Новый репорт #{report_id}\nОт: {message.from_user.full_name}\nНа: {data['offender_nick']}\nПричина: {data['reason']}",
-        reply_markup=get_admin_report_keyboard(report_id, message.from_user.id, message.from_user.full_name)
+        f"⚠️ Новый репорт #{report_id}\nОт: {message.from_user.full_name}\nНа: {data['offender_nick']}",
+        reply_markup=get_admin_report_keyboard(report_id, message.from_user.id)
     )
     await state.clear()
 
@@ -343,7 +357,7 @@ async def process_time(message: Message, state: FSMContext):
 @dp.callback_query()
 async def handle_callbacks(callback: CallbackQuery):
     data = callback.data
-    
+
     if data.startswith("accept_"):
         parts = data.split("_")
         request_id = int(parts[1])
@@ -352,7 +366,7 @@ async def handle_callbacks(callback: CallbackQuery):
         await bot.send_message(user_id, "✅ Вы приняты! IP: mc.flowsmp.online")
         await callback.message.edit_text(callback.message.text + "\n\n✅ Принято")
         await callback.answer()
-    
+
     elif data.startswith("reject_"):
         parts = data.split("_")
         request_id = int(parts[1])
@@ -361,7 +375,7 @@ async def handle_callbacks(callback: CallbackQuery):
         await bot.send_message(user_id, "❌ Вы не приняты. Попробуйте снова /request")
         await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
         await callback.answer()
-    
+
     elif data.startswith("accept_rep_"):
         parts = data.split("_")
         report_id = int(parts[2])
@@ -370,16 +384,16 @@ async def handle_callbacks(callback: CallbackQuery):
         await bot.send_message(user_id, "✅ Репорт принят к рассмотрению")
         await callback.message.edit_text(callback.message.text + "\n\n✅ Принято")
         await callback.answer()
-    
+
     elif data.startswith("reject_rep_"):
         parts = data.split("_")
         report_id = int(parts[2])
         user_id = int(parts[3])
         update_report_status(report_id, 'rejected')
-        await bot.send_message(user_id, "❌ Репорт отклонён. Недостаточно доказательств")
+        await bot.send_message(user_id, "❌ Репорт отклонён.")
         await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
         await callback.answer()
-    
+
     elif data == "info":
         await cmd_info(callback.message)
         await callback.answer()
@@ -402,7 +416,7 @@ async def handle_buttons(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state:
         return
-    
+
     text = message.text
     if text == "⚡️Старт":
         await cmd_start(message)
@@ -415,24 +429,30 @@ async def handle_buttons(message: Message, state: FSMContext):
     elif text == "⚠️ Репорт":
         await cmd_report(message, state)
 
-# ==================== ЗАПУСК ====================
+# ==================== FASTAPI И ЗАПУСК ====================
+# Функция для запуска бота в отдельном потоке
 def run_bot():
     asyncio.run(dp.start_polling(bot))
 
-@app.route('/')
-def index():
-    return jsonify({"status": "Бот работает", "mode": "polling"})
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
-
-if __name__ == "__main__":
-    # Запускаем бота в фоне
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запускаем бота в фоне при старте FastAPI
     thread = threading.Thread(target=run_bot, daemon=True)
     thread.start()
-    logger.info("✅ Бот запущен")
-    
-    # Запускаем Flask
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    logger.info("✅ Бот запущен в фоновом режиме")
+    yield
+
+# Создаём FastAPI приложение
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+async def root():
+    return {"status": "Bot is running", "mode": "polling"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+# Для локального теста
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
